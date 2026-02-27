@@ -26,6 +26,8 @@ import os
 import sys
 import urllib.request
 import threading
+import subprocess
+import platform
 
 # ===== Configs =====
 CAM_INDEX = 0
@@ -58,6 +60,11 @@ DEAD_ZONE_PX = 0.5
 # --- Joia (pause/resume) ---
 THUMBS_HOLD_TIME = 2.0
 THUMBS_COOLDOWN  = 1.5
+
+# --- Duplo Clap (abrir/fechar mão duas vezes → abre Chrome) ---
+CLAP_COOLDOWN = 0.3      # tempo mínimo entre claps
+CLAP_TIMEOUT = 1.0       # tempo máximo entre dois claps pra contar como duplo
+DOUBLE_CLAP_OPEN_TIMEOUT = 0.5  # tempo máximo pra mão ficar aberta entre claps
 
 # --- Sistema ---
 pyautogui.FAILSAFE = False
@@ -162,6 +169,15 @@ def finger_extended(lms, tip, pip):
 def thumb_extended(lms):
     """Polegar estendido se ponta (4) mais afastada horizontalmente do wrist que o IP (3)."""
     return abs(lms[4].x - lms[0].x) > abs(lms[3].x - lms[0].x)
+
+def is_hand_closed(lms):
+    """Retorna True se a mão está completamente fechada (todos dedos menos polegar)."""
+    # Verificar se todos os dedos estão fechados (ponta abaixo do PIP)
+    index_closed  = lms[8].y  > lms[6].y
+    middle_closed = lms[12].y > lms[10].y
+    ring_closed   = lms[16].y > lms[14].y
+    pinky_closed  = lms[20].y > lms[18].y
+    return index_closed and middle_closed and ring_closed and pinky_closed
 
 def detect_gesture(lms):
     """Retorna o gesto atual baseado nos landmarks.
@@ -299,6 +315,11 @@ pinch_active = False   # True enquanto estiver em estado de pinça (histerese)
 # Scroll
 scroll_anchor_y = None  # y normalizado quando entrou em modo scroll
 
+# Duplo Clap (abertura e fechamento da mão)
+clap_count = 0          # número de claps detectados
+last_clap_t = 0.0       # timestamp do último clap
+hand_was_open = True    # rastreia se mão estava aberta no frame anterior
+
 # Janela
 window_name = "Gesture Mouse v2"
 window_hidden = False
@@ -311,6 +332,28 @@ def draw_text(img, text, pos, scale=0.7, color=(255, 255, 255),
                     cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness+2)
     cv2.putText(img, text, pos,
                 cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+
+
+def open_chrome():
+    """Abre o navegador Chrome (ou Chromium no Linux)."""
+    try:
+        if platform.system() == "Windows":
+            chrome_paths = [
+                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            ]
+            for path in chrome_paths:
+                if os.path.exists(path):
+                    subprocess.Popen([path])
+                    return
+            # Se não encontrar nos caminhos padrão, tenta abrir direto
+            os.startfile("chrome.exe") if hasattr(os, 'startfile') else subprocess.Popen(["chrome"])
+        elif platform.system() == "Darwin":  # macOS
+            subprocess.Popen(["open", "-a", "Google Chrome"])
+        else:  # Linux
+            subprocess.Popen(["google-chrome"])
+    except Exception as e:
+        print(f"Erro ao abrir Chrome: {e}")
 
 
 def draw_hud(frame, status, pinch_dist, gesture, fps_val):
@@ -337,6 +380,10 @@ def draw_hud(frame, status, pinch_dist, gesture, fps_val):
 
     # FPS
     draw_text(frame, f"FPS: {fps_val}", (w - 120, 30), 0.6, (180, 180, 180), 1)
+    
+    # Indicador de claps
+    clap_color = (100, 100, 255) if clap_count > 0 else (100, 100, 100)
+    draw_text(frame, f"Claps: {clap_count}/2", (w - 120, 60), 0.6, clap_color, 1)
 
     # Pinch distance
     if pinch_dist is not None:
@@ -353,6 +400,7 @@ def draw_hud(frame, status, pinch_dist, gesture, fps_val):
         "Pulso: Mover cursor",
         "Pinca (pol+ind): Soltar=Clique | Manter=Segurar",
         "Dedo medio: Scroll cima/baixo",
+        "Duplo Clap (fechar 2x): Abre Chrome",
         "Q: Sair | M: Minimizar",
     ]
     y0 = h - 15 * len(legend) - 5
@@ -408,6 +456,30 @@ while not _quit_flag:
         mx, my = landmarks[12].x, landmarks[12].y  # ponta médio
 
         pinch_dist = float(np.hypot(ix - tx, iy - ty))
+
+        # ===== DUPLO CLAP (abrir/fechar mão 2x → abre Chrome) =====
+        hand_closed = is_hand_closed(landmarks)
+        
+        # Detectar transição de aberto → fechado (clap)
+        if hand_was_open and hand_closed:
+            # Mão foi de aberta para fechada = um clap
+            time_since_last_clap = now - last_clap_t
+            
+            if time_since_last_clap > CLAP_COOLDOWN:
+                clap_count += 1
+                last_clap_t = now
+                
+                # Duplo clap detectado!
+                if clap_count >= 2:
+                    print("[DUPLO CLAP] Abrindo Chrome...")
+                    open_chrome()
+                    clap_count = 0  # Reset
+        
+        # Reset contador se ultrapassou timeout
+        if now - last_clap_t > CLAP_TIMEOUT and clap_count > 0:
+            clap_count = 0
+        
+        hand_was_open = not hand_closed
 
         # ===== SCROLL MODE (dedo do meio estendido) =====
         if gesture == "scroll":
